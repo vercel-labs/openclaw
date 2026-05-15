@@ -385,6 +385,7 @@ describe("sendMessageSlack file upload with user IDs", () => {
 
     await sendMessageSlack("channel:C123CHAN", "caption", {
       token: "xoxb-test",
+      cfg: SLACK_TEST_CFG,
       client,
       mediaUrl: "generated-image.png",
       mediaAccess,
@@ -418,6 +419,7 @@ describe("sendMessageSlack file upload with user IDs", () => {
 
     await sendMessageSlack("channel:C123CHAN", "caption", {
       token: "xoxb-test",
+      cfg: SLACK_TEST_CFG,
       client,
       mediaUrl: "/tmp/threaded.png",
       threadTs: "1778530504.140709",
@@ -442,6 +444,7 @@ describe("sendMessageSlack file upload with user IDs", () => {
     await expect(
       sendMessageSlack("channel:C123CHAN", "caption", {
         token: "xoxb-test",
+        cfg: SLACK_TEST_CFG,
         client,
         mediaUrl: "/tmp/threaded.png",
         threadTs: "1778530504.140709",
@@ -461,6 +464,7 @@ describe("sendMessageSlack file upload with user IDs", () => {
 
     await sendMessageSlack("channel:C123CHAN", "caption", {
       token: "xoxb-test",
+      cfg: SLACK_TEST_CFG,
       client,
       mediaUrl: "/tmp/threaded.png",
       threadTs: "1778530504.140709",
