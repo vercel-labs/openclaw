@@ -14,6 +14,7 @@ const listSlackReactions = vi.fn(async (..._args: unknown[]) => ({}));
 const pinSlackMessage = vi.fn(async (..._args: unknown[]) => ({}));
 const reactSlackMessage = vi.fn(async (..._args: unknown[]) => ({}));
 const readSlackMessages = vi.fn(async (..._args: unknown[]) => ({}));
+const recordSlackThreadParticipation = vi.fn();
 const removeOwnSlackReactions = vi.fn(async (..._args: unknown[]) => ["thumbsup"]);
 const removeSlackReaction = vi.fn(async (..._args: unknown[]) => ({}));
 const sendSlackMessage = vi.fn(async (..._args: unknown[]) => ({ channelId: "C123" }));
@@ -102,6 +103,7 @@ describe("handleSlackAction", () => {
       pinSlackMessage,
       reactSlackMessage,
       readSlackMessages,
+      recordSlackThreadParticipation,
       removeOwnSlackReactions,
       removeSlackReaction,
       sendSlackMessage,
@@ -651,6 +653,7 @@ describe("handleSlackAction", () => {
     );
 
     expect(sendSlackMessage).toHaveBeenCalledWith("user:U123", "Here it is", {
+      cfg: expect.any(Object),
       mediaUrl: "/tmp/self-portrait.png",
       mediaLocalRoots: undefined,
       mediaReadFile: undefined,
@@ -681,6 +684,7 @@ describe("handleSlackAction", () => {
     );
 
     expect(sendSlackMessage).toHaveBeenCalledWith("user:U999", "Here it is", {
+      cfg: expect.any(Object),
       mediaUrl: "/tmp/self-portrait.png",
       mediaLocalRoots: undefined,
       mediaReadFile: undefined,
