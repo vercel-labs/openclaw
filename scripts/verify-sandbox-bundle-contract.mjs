@@ -1,10 +1,20 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import {
+  findReachableTelegramDurableAckProducer,
+  readSandboxArchiveJavaScriptModules,
+} from "./lib/sandbox-bundle-capability-proof.mjs";
+import {
+  assertSandboxBundleCapabilities,
+  assertSandboxBundleCapabilityHooks,
+} from "./lib/sandbox-bundle-capabilities.mjs";
+import { assertSafeSandboxArchive, sandboxArchiveLimits } from "./lib/sandbox-archive-contract.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, "..");
@@ -17,6 +27,9 @@ const REQUIRED_FILES = [
   "bundle-deps.tar.gz",
   "bundle-openclaw-pkg.tar.gz",
   "channels.tar.gz",
+  "runtime-plugins.tar.gz",
+  "external-plugins.json",
+  "bundle-capabilities.json",
   "openclaw-release.tar.gz",
   "meta.json",
   "release.json",
@@ -28,17 +41,25 @@ const RELEASE_TAR_REQUIRED_ENTRIES = [
   "bundle-contract.json",
   "bundle-deps.tar.gz",
   "bundle-openclaw-pkg.tar.gz",
+  "bundle-capabilities.json",
   "channels.tar.gz",
+  "external-plugins.json",
+  "runtime-plugins.tar.gz",
   "openclaw.bundle.mjs",
   "release.json",
 ];
-
 async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
 function fail(message) {
   throw new Error(message);
+}
+
+function requireExactSha(value, label) {
+  if (!/^[a-f0-9]{40}$/u.test(value ?? "")) {
+    fail(`${label} must be an exact 40-character lowercase git SHA`);
+  }
 }
 
 async function fileSize(fileName) {
@@ -50,6 +71,12 @@ async function fileSize(fileName) {
     throw err;
   });
   return info.size;
+}
+
+async function sha256File(fileName) {
+  return createHash("sha256")
+    .update(await readFile(path.join(OUT_DIR, fileName)))
+    .digest("hex");
 }
 
 function listTarEntries(fileName) {
@@ -75,6 +102,58 @@ function listTarEntries(fileName) {
       reject(new Error(`tar -tzf ${fileName} exited with code ${code ?? signal}: ${stderr}`));
     });
   });
+}
+
+function readTarEntry(fileName, entryName) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("tar", ["-xOf", fileName, entryName], {
+      cwd: OUT_DIR,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", reject);
+    child.on("exit", (code, signal) => {
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(
+          new Error(
+            `tar -xOf ${fileName} ${entryName} exited with code ${code ?? signal}: ${stderr}`,
+          ),
+        );
+      }
+    });
+  });
+}
+
+async function verifyPackagedTelegramDurableAck(hasSharedChunks) {
+  const archives = ["channels.tar.gz"];
+  if (hasSharedChunks) {
+    archives.push("channel-shared-chunks.tar.gz");
+  }
+  const modules = await readSandboxArchiveJavaScriptModules({
+    archives: archives.map((fileName) => ({
+      archivePath: path.join(OUT_DIR, fileName),
+      fileName,
+    })),
+  });
+  if (
+    !(await findReachableTelegramDurableAckProducer({
+      modules,
+      readText: (module) => module.content.toString("utf8"),
+    }))
+  ) {
+    fail(
+      "packaged Telegram runtime lacks durable enqueue -> acceptance header -> 200 response ordering",
+    );
+  }
 }
 
 function assertBudget(bytes, maxBytes, label) {
@@ -123,6 +202,7 @@ function inputMatchesModule(inputPath, moduleName) {
 async function main() {
   const manifest = await readJson(PROFILE_PATH);
   const budgets = manifest.budgets ?? {};
+  const archiveLimits = sandboxArchiveLimits(budgets);
 
   const sizes = {};
   for (const file of REQUIRED_FILES) {
@@ -156,8 +236,43 @@ async function main() {
     "openclaw-release.tar.gz",
   );
 
+  for (const fileName of [
+    "bundle-deps.tar.gz",
+    "bundle-openclaw-pkg.tar.gz",
+    "channels.tar.gz",
+    "runtime-plugins.tar.gz",
+    "openclaw-release.tar.gz",
+    ...(typeof sizes["channel-shared-chunks.tar.gz"] === "number"
+      ? ["channel-shared-chunks.tar.gz"]
+      : []),
+  ]) {
+    await assertSafeSandboxArchive({
+      archivePath: path.join(OUT_DIR, fileName),
+      archiveLabel: fileName,
+      limits: archiveLimits,
+    });
+  }
+
+  const externalPlugins = await readJson(path.join(OUT_DIR, "external-plugins.json"));
+  if (externalPlugins.schemaVersion !== 1 || !Array.isArray(externalPlugins.plugins)) {
+    fail("external-plugins.json has invalid schemaVersion or plugins");
+  }
+  const externalPluginArtifacts = externalPlugins.plugins.map((plugin) => plugin.artifact);
+  for (const plugin of externalPlugins.plugins) {
+    const pluginBytes = await fileSize(plugin.artifact);
+    assertBudget(pluginBytes, budgets.externalPluginTarMaxBytes, plugin.artifact);
+    await assertSafeSandboxArchive({
+      archivePath: path.join(OUT_DIR, plugin.artifact),
+      archiveLabel: plugin.artifact,
+      limits: archiveLimits,
+    });
+    if ((await sha256File(plugin.artifact)) !== plugin.sha256) {
+      fail(`external plugin artifact digest mismatch for ${plugin.id}`);
+    }
+  }
   const expectedReleaseTarEntries = [
     ...RELEASE_TAR_REQUIRED_ENTRIES,
+    ...externalPluginArtifacts,
     ...(typeof sizes["channel-shared-chunks.tar.gz"] === "number"
       ? ["channel-shared-chunks.tar.gz"]
       : []),
@@ -170,6 +285,48 @@ async function main() {
       `openclaw-release.tar.gz entries mismatch: expected ${expectedReleaseTarEntries.join(", ")}; got ${releaseTarEntries.join(", ")}`,
     );
   }
+  const runtimePluginEntries = await listTarEntries("runtime-plugins.tar.gz");
+  for (const entry of [
+    "admin-http-rpc/index.js",
+    "admin-http-rpc/openclaw.plugin.json",
+    "admin-http-rpc/package.json",
+  ]) {
+    if (!runtimePluginEntries.includes(entry)) {
+      fail(`runtime-plugins.tar.gz lacks required entry ${entry}`);
+    }
+  }
+  const adminPackage = JSON.parse(
+    await readTarEntry("runtime-plugins.tar.gz", "admin-http-rpc/package.json"),
+  );
+  const adminManifest = JSON.parse(
+    await readTarEntry("runtime-plugins.tar.gz", "admin-http-rpc/openclaw.plugin.json"),
+  );
+  if (
+    adminPackage.name !== "@openclaw/admin-http-rpc" ||
+    !adminPackage.openclaw?.extensions?.includes("./index.js") ||
+    adminManifest.id !== "admin-http-rpc" ||
+    !adminManifest.activation?.onConfigPaths?.includes("plugins.entries.admin-http-rpc") ||
+    !adminManifest.contracts?.gatewayMethodDispatch?.includes("authenticated-request")
+  ) {
+    fail("runtime-plugins.tar.gz has invalid admin-http-rpc contract");
+  }
+  const adminSource = (
+    await Promise.all(
+      runtimePluginEntries
+        .filter((entry) => entry.startsWith("admin-http-rpc/") && entry.endsWith(".js"))
+        .map((entry) => readTarEntry("runtime-plugins.tar.gz", entry)),
+    )
+  ).join("\n");
+  for (const method of [
+    "gateway.suspend.prepare",
+    "gateway.suspend.status",
+    "gateway.suspend.resume",
+  ]) {
+    if (!adminSource.includes(method)) {
+      fail(`runtime-plugins.tar.gz admin-http-rpc lacks ${method}`);
+    }
+  }
+  await verifyPackagedTelegramDurableAck(typeof sizes["channel-shared-chunks.tar.gz"] === "number");
 
   // Static-import dual-load guard.
   // Bundling a static `import { ... } from "<dep>"` for a dep that is also
@@ -231,11 +388,61 @@ async function main() {
   );
 
   const release = await readJson(path.join(OUT_DIR, "release.json"));
-  if (typeof release.forkSha !== "string" || release.forkSha.length === 0) {
-    fail("release.json lacks forkSha");
+  const capabilities = await readJson(path.join(OUT_DIR, "bundle-capabilities.json"));
+  if (release.schemaVersion !== 2 || release.capabilityManifest !== "bundle-capabilities.json") {
+    fail("release.json has invalid schemaVersion or capabilityManifest");
   }
-  if (typeof release.bundleSha256 !== "string" || release.bundleSha256.length === 0) {
-    fail("release.json lacks bundleSha256");
+  requireExactSha(release.forkSha, "release.json forkSha");
+  requireExactSha(release.upstreamSha, "release.json upstreamSha");
+  if (release.bundleSha256 !== (await sha256File("openclaw.bundle.mjs"))) {
+    fail("release.json bundleSha256 does not match openclaw.bundle.mjs");
+  }
+  if (capabilities.schemaVersion !== 1 || capabilities.profile !== manifest.profile) {
+    fail("bundle-capabilities.json has invalid schemaVersion or profile");
+  }
+  assertSandboxBundleCapabilities(capabilities.capabilities, "bundle-capabilities.json");
+  assertSandboxBundleCapabilityHooks({
+    capabilities: capabilities.capabilities,
+    bundleSource,
+    label: "openclaw.bundle.mjs",
+  });
+  assertSandboxBundleCapabilities(contract.capabilities, "bundle-contract.json");
+  if (JSON.stringify(contract.capabilities) !== JSON.stringify(capabilities.capabilities)) {
+    fail("bundle-contract.json capabilities do not match bundle-capabilities.json");
+  }
+  if (!capabilities.pluginIds?.includes("admin-http-rpc")) {
+    fail("bundle-capabilities.json lacks admin-http-rpc plugin");
+  }
+  if (!capabilities.pluginIds?.includes("slack")) {
+    fail("bundle-capabilities.json lacks Slack plugin");
+  }
+  if (!capabilities.pluginIds?.includes("telegram")) {
+    fail("bundle-capabilities.json lacks Telegram plugin");
+  }
+  if (
+    JSON.stringify(capabilities.externalPlugins) !== JSON.stringify(externalPlugins.plugins) ||
+    JSON.stringify(contract.externalPlugins) !== JSON.stringify(externalPlugins.plugins) ||
+    JSON.stringify(release.externalPlugins) !== JSON.stringify(externalPlugins.plugins)
+  ) {
+    fail("external plugin metadata differs across bundle manifests");
+  }
+  if (
+    JSON.stringify(capabilities.package) !== JSON.stringify(release.package) ||
+    JSON.stringify(capabilities.source) !== JSON.stringify(release.source) ||
+    JSON.stringify(contract.package) !== JSON.stringify(release.package) ||
+    JSON.stringify(contract.source) !== JSON.stringify(release.source)
+  ) {
+    fail("release.json identity does not match bundle-capabilities.json");
+  }
+  if (
+    release.forkSha !== release.source?.fork?.sha ||
+    release.upstreamSha !== release.source?.upstream?.sha ||
+    release.forkRef !== release.source?.fork?.ref ||
+    release.source?.fork?.repository !== manifest.source?.forkRepository ||
+    release.source?.upstream?.repository !== manifest.source?.upstreamRepository ||
+    contract.packageVersion !== release.package?.version
+  ) {
+    fail("release.json source identity does not match the profile or legacy identity fields");
   }
 
   console.log(
@@ -247,6 +454,7 @@ async function main() {
       pkgTarBytes: sizes["bundle-openclaw-pkg.tar.gz"],
       releaseTarBytes: sizes["openclaw-release.tar.gz"],
       channelsTarBytes: sizes["channels.tar.gz"],
+      runtimePluginsTarBytes: sizes["runtime-plugins.tar.gz"],
       sharedChunksTarBytes: sizes["channel-shared-chunks.tar.gz"] ?? null,
       pluginSdkSubpathCount: contract.pluginSdkSubpaths.length,
       disabledPublicSurfaceCount: Array.isArray(contract.disabledPublicSurfaces)
